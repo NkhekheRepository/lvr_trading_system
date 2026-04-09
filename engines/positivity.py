@@ -1,13 +1,25 @@
 """
-Positivity Engine - Ensures only positive edge trades are executed.
+Staged Positivity Governor - System-level profitability governor.
 
-Monitors edge estimates and blocks trades when edge turns negative.
+Monitors system edge and transitions through phases:
+- NORMAL: Full operation
+- CAUTION: Reduced size, no new signals
+- DERISK: Block new signals, reduce exposure
+- HARD_STOP: Block all trades, force close
+
+Features:
+- Threshold-based transitions with persistence
+- Hysteresis to prevent oscillation
+- Drawdown integration
+- Gradual recovery
 """
 
 import logging
-from typing import Optional
+import numpy as np
+from typing import Optional, NamedTuple
 from dataclasses import asdict
 from datetime import datetime
+from collections import deque
 
 from core.event import Event, EventType
 from core.bus import EventBus
@@ -16,164 +28,346 @@ from core.state import DistributedState
 logger = logging.getLogger(__name__)
 
 
-class PositivityEngine:
-    """
-    Enforces positive edge requirement before trade execution.
+class Phase(NamedTuple):
+    name: str
+    exposure_mult: float
+    block_signals: bool
+    block_all: bool
+    force_close: bool
+
+
+class PhaseConfig:
+    NORMAL = Phase("NORMAL", 1.0, False, False, False)
+    CAUTION = Phase("CAUTION", 0.5, False, False, False)
+    DERISK = Phase("DERISK", 0.2, True, False, False)
+    HARD_STOP = Phase("HARD_STOP", 0.0, True, True, True)
     
-    Conditions for trade:
-    - Expected edge must be positive
-    - Confidence must be above threshold
-    - Reality gap adjustment must not invalidate
+    _RANKING = {"NORMAL": 0, "CAUTION": 1, "DERISK": 2, "HARD_STOP": 3}
+
+
+class StagedPositivityGovernor:
+    """
+    System-level positivity governor with staged transitions.
+    
+    Edge = rolling(expected_return − fees − slippage − risk_penalty)
+    
+    Transitions based on:
+    - System edge vs soft/hard thresholds
+    - Drawdown vs limits
+    - Edge persistence over time
     """
     
-    MIN_EDGE_THRESHOLD = 0.0001
-    MIN_CONFIDENCE = 0.5
-    MIN_TRADE_PROBABILITY = 0.55
+    EDGE_SOFT_THRESHOLD = 0.0
+    EDGE_HARD_MULTIPLIER = 0.5
+    PERSISTENCE_WINDOW = 30
+    RECOVERY_WINDOW = 50
+    MIN_TRANSITION_INTERVAL = 300
+    
+    DRAWDOWN_LIMIT = 0.10
+    SEVERE_DRAWDOWN = 0.20
+    DRAWDOWN_RECOVERY = 0.05
     
     def __init__(
         self,
         bus: EventBus,
         state: Optional[DistributedState] = None,
-        min_edge: float = MIN_EDGE_THRESHOLD,
-        min_confidence: float = MIN_CONFIDENCE,
+        edge_std: float = 0.001,
     ):
         self.bus = bus
         self.state = state
-        self.min_edge = min_edge
-        self.min_confidence = min_confidence
-        self._positivity_history: dict[str, list[bool]] = {}
+        self.edge_std = edge_std
         
-    async def check_trade_positive(
-        self,
-        symbol: str,
-        edge_estimate: dict,
-        reality_gap: Optional[dict] = None
-    ) -> tuple[bool, str]:
-        """
-        Check if trade meets positivity requirements.
+        self._phase = PhaseConfig.NORMAL
+        self._edge_hard_threshold = -edge_std * self.EDGE_HARD_MULTIPLIER
         
-        Returns:
-            (approved, reason)
-        """
-        expected_edge = edge_estimate.get('expected_edge', 0)
-        confidence = edge_estimate.get('confidence', 0)
+        self._edge_history = deque(maxlen=100)
+        self._phase_history: list[dict] = []
+        self._last_transition_time: float = 0
+        self._transition_count = 0
         
-        if expected_edge <= 0:
-            self._record_result(symbol, False)
-            return False, "negative_or_zero_edge"
-        
-        if expected_edge < self.min_edge:
-            self._record_result(symbol, False)
-            return False, f"edge_below_minimum_{expected_edge:.6f}"
-        
-        if confidence < self.min_confidence:
-            self._record_result(symbol, False)
-            return False, f"confidence_too_low_{confidence:.2f}"
-        
-        if reality_gap:
-            adjustment = reality_gap.get('adjustment_factor', 1.0)
-            adjusted_edge = expected_edge * adjustment
-            
-            if adjusted_edge <= 0:
-                self._record_result(symbol, False)
-                return False, f"adjusted_edge_negative_{adjusted_edge:.6f}"
-        
-        trade_prob = self._estimate_trade_probability(
-            expected_edge, confidence, reality_gap
-        )
-        
-        if trade_prob < self.MIN_TRADE_PROBABILITY:
-            self._record_result(symbol, False)
-            return False, f"trade_probability_too_low_{trade_prob:.2f}"
-        
-        self._record_result(symbol, True)
-        return True, "approved"
+        self._current_exposure_mult = 1.0
+        self._recovery_start_time: Optional[float] = None
     
-    def _estimate_trade_probability(
+    @property
+    def phase(self) -> str:
+        return self._phase.name
+    
+    def evaluate(
+        self,
+        system_edge: float,
+        current_drawdown: float,
+        portfolio_metrics: Optional[dict] = None
+    ) -> 'PhaseDecision':
+        """
+        Evaluate system state and determine phase.
+        
+        Args:
+            system_edge: Rolling system edge (expected_return - costs)
+            current_drawdown: Current portfolio drawdown (0-1)
+            portfolio_metrics: Optional additional metrics
+            
+        Returns:
+            PhaseDecision with action details
+        """
+        self._edge_history.append(system_edge)
+        
+        persistence_window = min(self.PERSISTENCE_WINDOW, len(self._edge_history))
+        recent_edge = np.mean(list(self._edge_history)[-persistence_window:])
+        
+        new_phase = self._determine_phase(recent_edge, current_drawdown, portfolio_metrics)
+        
+        if new_phase.name != self._phase.name:
+            if self._can_transition(new_phase.name):
+                self._transition(new_phase, system_edge, current_drawdown)
+            else:
+                pass
+        
+        return PhaseDecision(
+            phase=self._phase.name,
+            exposure_mult=self._phase.exposure_mult,
+            block_signals=self._phase.block_signals,
+            block_all=self._phase.block_all,
+            force_close=self._phase.force_close,
+            system_edge=system_edge,
+            recent_edge=recent_edge,
+            current_drawdown=current_drawdown,
+            transition_reason=self._phase_history[-1]['reason'] if self._phase_history else None,
+        )
+    
+    def _determine_phase(
+        self,
+        recent_edge: float,
+        drawdown: float,
+        metrics: Optional[dict]
+    ) -> Phase:
+        """Determine target phase based on conditions."""
+        
+        if self._is_hard_stop_condition(recent_edge, drawdown):
+            return PhaseConfig.HARD_STOP
+        
+        if self._is_derisk_condition(recent_edge, drawdown, metrics):
+            return PhaseConfig.DERISK
+        
+        if self._is_caution_condition(recent_edge):
+            return PhaseConfig.CAUTION
+        
+        if self._is_recovering():
+            return self._get_recovery_phase()
+        
+        return PhaseConfig.NORMAL
+    
+    def _is_hard_stop_condition(self, edge: float, drawdown: float) -> bool:
+        """Check if hard stop conditions are met."""
+        if drawdown >= self.SEVERE_DRAWDOWN:
+            return True
+        if edge < self._edge_hard_threshold * 2:
+            return True
+        return False
+    
+    def _is_derisk_condition(
         self,
         edge: float,
-        confidence: float,
-        reality_gap: Optional[dict]
-    ) -> float:
-        base_prob = 0.5 + edge * 1000
-        
-        confidence_boost = confidence * 0.3
-        
-        gap_adjustment = 1.0
-        if reality_gap:
-            gap_adjustment = reality_gap.get('adjustment_factor', 1.0)
-        
-        probability = (base_prob + confidence_boost) * gap_adjustment
-        
-        return max(0.1, min(0.95, probability))
+        drawdown: float,
+        metrics: Optional[dict]
+    ) -> bool:
+        """Check if de-risk conditions are met."""
+        if edge < self._edge_hard_threshold:
+            return True
+        if drawdown > self.DRAWDOWN_LIMIT * 0.8 and self._is_drawdown_increasing():
+            return True
+        return False
     
-    def _record_result(self, symbol: str, positive: bool) -> None:
-        history = self._positivity_history.setdefault(symbol, [])
-        history.append(positive)
-        if len(history) > 100:
-            history = history[-100:]
-        self._positivity_history[symbol] = history
+    def _is_caution_condition(self, edge: float) -> bool:
+        """Check if caution conditions are met."""
+        return edge < self.EDGE_SOFT_THRESHOLD
     
-    async def get_positivity_stats(self, symbol: str) -> dict:
-        """Get positivity statistics for a symbol."""
-        history = self._positivity_history.get(symbol, [])
+    def _is_drawdown_increasing(self) -> bool:
+        """Check if drawdown is increasing over time."""
+        if len(self._edge_history) < 5:
+            return False
         
-        if not history:
-            return {'count': 0, 'positive_rate': 0.0}
+        recent = list(self._edge_history)[-3:]
+        historical = list(self._edge_history)[:-3]
         
-        positive_count = sum(1 for x in history if x)
+        if not historical:
+            return False
         
-        return {
-            'count': len(history),
-            'positive_count': positive_count,
-            'positive_rate': positive_count / len(history),
-            'recent_rate': sum(1 for x in history[-20:] if x) / min(20, len(history)),
+        recent_dd = np.mean([abs(e) for e in recent])
+        historical_dd = np.mean([abs(e) for e in historical])
+        
+        return recent_dd > historical_dd * 1.1
+    
+    def _is_recovering(self) -> bool:
+        """Check if system is in recovery mode."""
+        return self._recovery_start_time is not None
+    
+    def _get_recovery_phase(self) -> Phase:
+        """Get appropriate phase during recovery."""
+        if not self._phase_history:
+            return PhaseConfig.NORMAL
+        
+        recent_transitions = [
+            t for t in self._phase_history
+            if t.get('timestamp', 0) > self._recovery_start_time - 1000
+        ]
+        
+        if any(t['to'] in ('DERISK', 'HARD_STOP') for t in recent_transitions):
+            return PhaseConfig.CAUTION
+        
+        return PhaseConfig.NORMAL
+    
+    def _can_transition(self, new_phase: str) -> bool:
+        """Check if transition is allowed (hysteresis)."""
+        now = datetime.now().timestamp()
+        
+        if PhaseConfig._RANKING[new_phase] > PhaseConfig._RANKING[self._phase.name]:
+            if now - self._last_transition_time < self.MIN_TRANSITION_INTERVAL:
+                return False
+        
+        return True
+    
+    def _transition(self, new_phase: Phase, edge: float, drawdown: float) -> None:
+        """Execute phase transition."""
+        old_phase = self._phase.name
+        self._phase = new_phase
+        self._transition_count += 1
+        self._last_transition_time = datetime.now().timestamp()
+        
+        transition = {
+            'from': old_phase,
+            'to': new_phase.name,
+            'edge': edge,
+            'drawdown': drawdown,
+            'timestamp': self._last_transition_time,
+            'reason': self._get_transition_reason(old_phase, new_phase.name, edge, drawdown),
         }
-    
-    async def adjust_edge_threshold(
-        self,
-        symbol: str,
-        current_stats: dict
-    ) -> float:
-        """
-        Dynamically adjust edge threshold based on recent performance.
-        """
-        recent_rate = current_stats.get('recent_rate', 0.5)
+        self._phase_history.append(transition)
         
-        if recent_rate > 0.7:
-            return self.min_edge * 0.8
-        elif recent_rate < 0.4:
-            return self.min_edge * 1.5
+        if len(self._phase_history) > 100:
+            self._phase_history = self._phase_history[-100:]
+        
+        if PhaseConfig._RANKING[new_phase.name] > PhaseConfig._RANKING[old_phase]:
+            self._recovery_start_time = None
         else:
-            return self.min_edge
-    
-    async def emit_positivity_alert(
-        self,
-        symbol: str,
-        reason: str,
-        edge_estimate: dict
-    ) -> None:
-        """Emit alert when positivity check fails."""
+            self._recovery_start_time = self._last_transition_time
+        
+        self._emit_state_change(transition)
+        
         logger.warning(
-            f"Positivity check failed for {symbol}: {reason}",
-            extra={
-                'symbol': symbol,
-                'reason': reason,
-                'edge': edge_estimate.get('expected_edge', 0),
-                'confidence': edge_estimate.get('confidence', 0),
-            }
+            f"Positivity governor transition: {old_phase} -> {new_phase.name}",
+            extra=transition
+        )
+    
+    def _get_transition_reason(
+        self,
+        from_phase: str,
+        to_phase: str,
+        edge: float,
+        drawdown: float
+    ) -> str:
+        """Generate human-readable transition reason."""
+        reasons = []
+        
+        if drawdown >= self.SEVERE_DRAWDOWN:
+            reasons.append(f"severe_drawdown_{drawdown:.2%}")
+        elif drawdown >= self.DRAWDOWN_LIMIT:
+            reasons.append(f"drawdown_limit_{drawdown:.2%}")
+        
+        if edge < self._edge_hard_threshold * 2:
+            reasons.append(f"critical_edge_{edge:.6f}")
+        elif edge < self._edge_hard_threshold:
+            reasons.append(f"negative_edge_{edge:.6f}")
+        elif edge < self.EDGE_SOFT_THRESHOLD:
+            reasons.append(f"soft_edge_{edge:.6f}")
+        
+        return "; ".join(reasons) if reasons else "unknown"
+    
+    def _emit_state_change(self, transition: dict) -> None:
+        """Emit state change event."""
+        if not self.bus:
+            return
+        
+        event = Event.create(
+            event_type=EventType.SYSTEM_STATE_CHANGED,
+            payload={
+                'governor': 'positivity',
+                'from_phase': transition['from'],
+                'to_phase': transition['to'],
+                'reason': transition['reason'],
+                'edge': transition['edge'],
+                'drawdown': transition['drawdown'],
+                'exposure_mult': self._phase.exposure_mult,
+            },
+            source="positivity_governor",
         )
         
-        if self.bus:
-            alert_event = Event.create(
-                event_type=EventType.STRATEGY_TERMINATION,
-                symbol=symbol,
-                payload={
-                    'reason': f"positivity_check_failed_{reason}",
-                    'edge': edge_estimate.get('expected_edge', 0),
-                    'confidence': edge_estimate.get('confidence', 0),
-                    'severity': 'WARNING',
-                },
-                source="positivity_engine",
-            )
-            await self.bus.publish(alert_event)
+        asyncio.create_task(self.bus.publish(event))
+    
+    def should_block_signals(self) -> bool:
+        """Check if new signals should be blocked."""
+        return self._phase.block_signals
+    
+    def should_force_close(self) -> bool:
+        """Check if positions should be force closed."""
+        return self._phase.force_close
+    
+    def get_exposure_multiplier(self) -> float:
+        """Get current exposure multiplier."""
+        return self._phase.exposure_mult
+    
+    def record_outcome(self, edge: float, pnl: float) -> None:
+        """Record trade outcome for tracking."""
+        self._edge_history.append(edge)
+    
+    async def get_governor_report(self) -> dict:
+        """Get comprehensive governor report."""
+        recent_edge = np.mean(list(self._edge_history)[-self.PERSISTENCE_WINDOW:]) if self._edge_history else 0
+        
+        return {
+            'phase': self._phase.name,
+            'exposure_mult': self._phase.exposure_mult,
+            'block_signals': self._phase.block_signals,
+            'block_all': self._phase.block_all,
+            'force_close': self._phase.force_close,
+            'system_edge': self._edge_history[-1] if self._edge_history else 0,
+            'recent_edge': recent_edge,
+            'transition_count': self._transition_count,
+            'time_in_phase': (
+                datetime.now().timestamp() - self._last_transition_time
+                if self._last_transition_time else 0
+            ),
+            'phase_history': self._phase_history[-10:],
+        }
+    
+    async def update_state(self) -> None:
+        """Persist governor state."""
+        if not self.state:
+            return
+        
+        await self.state.set(
+            key="governor:positivity",
+            value={
+                'phase': self._phase.name,
+                'exposure_mult': self._phase.exposure_mult,
+                'transition_count': self._transition_count,
+                'last_transition': self._last_transition_time,
+                'edge_history': list(self._edge_history)[-50:],
+                'phase_history': self._phase_history[-20:],
+            },
+            trace_id="positivity_governor",
+        )
+
+
+class PhaseDecision(NamedTuple):
+    phase: str
+    exposure_mult: float
+    block_signals: bool
+    block_all: bool
+    force_close: bool
+    system_edge: float
+    recent_edge: float
+    current_drawdown: float
+    transition_reason: Optional[str]
+
+
+import asyncio

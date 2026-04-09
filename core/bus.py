@@ -68,6 +68,10 @@ class BusConfig:
     
     enable_persistence: bool = True
     enable_replay: bool = True
+    
+    redis_publish_retries: int = 3
+    redis_publish_retry_delay: float = 0.1
+    dedup_cache_max_size: int = 100000
 
 
 class EventBus(ABC):
@@ -232,6 +236,11 @@ class RedisEventBus(EventBus):
                 ON events(trace_id)
             """)
             
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_symbol_offset 
+                ON events(symbol, offset)
+            """)
+            
     async def disconnect(self) -> None:
         """Disconnect from Redis and PostgreSQL."""
         self._running = False
@@ -263,40 +272,80 @@ class RedisEventBus(EventBus):
         Publish event to Redis and persist to PostgreSQL.
         
         Order of operations:
-        1. Check for duplicate (idempotency)
+        1. Check for duplicate (idempotency) - in-memory + persistent
         2. Persist to PostgreSQL (durable log)
-        3. Publish to Redis (real-time)
+        3. Publish to Redis with retry (real-time)
         """
         async with self._lock:
             if event.event_id in self._processed_event_ids:
-                logger.debug(f"Duplicate event skipped: {event.event_id}")
+                logger.debug(f"Duplicate event skipped (in-memory): {event.event_id}")
                 return
-                
-            self._processed_event_ids.add(event.event_id)
-            if len(self._processed_event_ids) > 100000:
-                self._processed_event_ids = set(list(self._processed_event_ids)[-50000:])
             
+            self._processed_event_ids.add(event.event_id)
+            if len(self._processed_event_ids) > self.config.dedup_cache_max_size:
+                self._processed_event_ids = set(
+                    list(self._processed_event_ids)[-self.config.dedup_cache_max_size//2:]
+                )
+        
+        if self.config.enable_persistence and self._postgres:
+            is_dup = await self._is_duplicate_persistent(event.event_id)
+            if is_dup:
+                logger.debug(f"Duplicate event skipped (persistent): {event.event_id}")
+                return
+        
         try:
             if self.config.enable_persistence and self._postgres:
                 offset = await self._persist_to_postgres(event)
                 event.offset = offset
-                
+            
             if self._redis:
-                channel_name = f"{channel.value}:{event.type.value}"
-                await self._redis.publish(
-                    channel_name,
-                    event.to_json()
-                )
-                
-                await self._redis.publish(
-                    EventChannel.SYSTEM.value,
-                    event.to_json()
-                )
+                await self._publish_with_retry(event, channel)
                 
         except Exception as e:
             logger.error(f"Failed to publish event {event.event_id}: {e}")
             self._processed_event_ids.discard(event.event_id)
             raise
+    
+    async def _is_duplicate_persistent(self, event_id: str) -> bool:
+        """Check if event_id exists in PostgreSQL for persistent deduplication."""
+        if not self._postgres:
+            return False
+        try:
+            result = await self._postgres.fetchval(
+                "SELECT 1 FROM events WHERE event_id = $1 LIMIT 1",
+                event_id
+            )
+            return result is not None
+        except Exception as e:
+            logger.warning(f"Persistent dedup check failed: {e}")
+            return False
+    
+    async def _publish_with_retry(
+        self,
+        event: Event,
+        channel: EventChannel
+    ) -> None:
+        """Publish to Redis with exponential backoff retry."""
+        import redis as sync_redis
+        
+        payload = event.to_json()
+        channel_name = f"{channel.value}:{event.type.value}"
+        system_channel = EventChannel.SYSTEM.value
+        
+        for attempt in range(self.config.redis_publish_retries):
+            try:
+                await self._redis.publish(channel_name, payload)
+                await self._redis.publish(system_channel, payload)
+                return
+            except Exception as e:
+                if attempt == self.config.redis_publish_retries - 1:
+                    raise
+                delay = self.config.redis_publish_retry_delay * (2 ** attempt)
+                logger.warning(
+                    f"Redis publish failed (attempt {attempt + 1}): {e}. "
+                    f"Retrying in {delay}s"
+                )
+                await asyncio.sleep(delay)
             
     async def _persist_to_postgres(self, event: Event) -> int:
         """Persist event to PostgreSQL and return offset."""

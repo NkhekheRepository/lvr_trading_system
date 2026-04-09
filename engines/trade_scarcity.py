@@ -1,13 +1,23 @@
 """
-Trade Scarcity Engine - Handles low trade frequency situations.
+Trade Rate Governor - Controls excessive trading.
 
-Monitors and addresses situations where trading frequency drops abnormally.
+Instead of monitoring scarcity, this engine blocks excess trades when:
+- Trade rate exceeds maximum threshold
+- Symbol concentration is too high
+- Time-weighted constraints are violated
+
+Features:
+- Configurable rate limits per time window
+- Symbol concentration limits
+- Cooldown periods between trades
+- Gradual blocking with warnings
 """
 
 import logging
 from typing import Optional
-from dataclasses import asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from collections import deque
 
 from core.event import Event, EventType
 from core.bus import EventBus
@@ -16,271 +26,239 @@ from core.state import DistributedState
 logger = logging.getLogger(__name__)
 
 
-class TradeScarcityEngine:
+@dataclass
+class RateLimit:
+    window_seconds: int
+    max_trades: int
+    symbol_max_concentration: float = 0.3
+
+
+@dataclass
+class TradeRecord:
+    symbol: str
+    timestamp: int
+    outcome: Optional[str] = None
+
+
+class TradeRateGovernor:
     """
-    Monitors trade scarcity and adjusts system behavior.
+    Controls excessive trading through rate limiting.
     
-    Scarcity scenarios:
-    - No trades for extended period
-    - Signal generation dry spell
-    - Edge degradation
-    - Market conditions
+    Limits:
+    - Trades per time window (global)
+    - Trades per symbol (concentration)
+    - Minimum time between trades (cooldown)
     """
     
-    NO_TRADE_WARNING_HOURS = 2
-    NO_TRADE_CRITICAL_HOURS = 8
-    MIN_DAILY_TRADES = 3
-    SCARCITY_THRESHOLD = 0.5
+    DEFAULT_RATE_LIMITS = [
+        RateLimit(window_seconds=60, max_trades=5),      # 5 trades/minute
+        RateLimit(window_seconds=300, max_trades=15),    # 15 trades/5 minutes
+        RateLimit(window_seconds=3600, max_trades=50),  # 50 trades/hour
+    ]
+    
+    COOLDOWN_SECONDS = 5
+    MAX_CONCENTRATION = 0.3
+    WARNING_THRESHOLD = 0.8
     
     def __init__(
         self,
         bus: EventBus,
         state: Optional[DistributedState] = None,
-        check_interval_seconds: int = 300,
+        rate_limits: Optional[list[RateLimit]] = None,
     ):
         self.bus = bus
         self.state = state
-        self.check_interval = check_interval_seconds
+        self.rate_limits = rate_limits or self.DEFAULT_RATE_LIMITS
         
-        self._last_trade_time: Optional[int] = None
-        self._trade_count_today: int = 0
-        self._signal_count_today: int = 0
+        self._trade_history: deque[TradeRecord] = deque(maxlen=1000)
+        self._last_trade_times: dict[str, int] = {}
+        self._blocked_count = 0
+        self._total_check_count = 0
+        self._symbol_trades_today: dict[str, int] = {}
         self._last_reset_date: Optional[str] = None
-        self._scarcity_history: list[dict] = []
-        
-    async def check_scarcity(
+    
+    async def should_block_trade(
         self,
+        symbol: str,
         current_time: Optional[int] = None
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[bool, str]:
         """
-        Check for trade scarcity conditions.
+        Check if a trade should be blocked.
         
+        Args:
+            symbol: Trading symbol
+            current_time: Current timestamp in ms (optional)
+            
         Returns:
-            (status, recommendations)
+            (should_block, reason)
         """
+        self._total_check_count += 1
+        
         if current_time is None:
             current_time = int(datetime.now().timestamp() * 1000)
         
         await self._reset_daily_counts_if_needed()
         
-        time_since_trade = (
-            (current_time - self._last_trade_time) / (1000 * 60 * 60)
-            if self._last_trade_time else float('inf')
-        )
+        block, reason = self._check_cooldown(symbol, current_time)
+        if block:
+            return True, reason
         
-        status = "OK"
-        recommendations = []
+        block, reason = self._check_rate_limits(current_time)
+        if block:
+            return True, reason
         
-        if time_since_trade >= self.NO_TRADE_CRITICAL_HOURS:
-            status = "CRITICAL"
-            recommendations = [
-                "investigate_market_conditions",
-                "check_signal_generation",
-                "review_filter_effectiveness",
-                "consider_broader_universe",
-            ]
-        elif time_since_trade >= self.NO_TRADE_WARNING_HOURS:
-            status = "WARNING"
-            recommendations = [
-                "monitor_situation",
-                "review_recent_rejections",
-            ]
+        block, reason = self._check_concentration(symbol)
+        if block:
+            return True, reason
         
-        if self._trade_count_today < self.MIN_DAILY_TRADES:
-            status = "LOW_ACTIVITY" if status == "OK" else status
-            recommendations.append("low_trade_count_review")
-        
-        scarcity_score = self._calculate_scarcity_score(
-            time_since_trade,
-            self._trade_count_today,
-            self._signal_count_today
-        )
-        
-        if scarcity_score > self.SCARCITY_THRESHOLD:
-            status = "SCARCITY_DETECTED"
-            recommendations.extend([
-                "relax_filters_temporarily",
-                "check_market_opportunities",
-            ])
-        
-        await self._record_scarcity_check(status, scarcity_score)
-        
-        if status != "OK":
-            await self._emit_scarcity_alert(status, scarcity_score, recommendations)
-        
-        return status, recommendations
+        return False, ""
     
-    def _calculate_scarcity_score(
-        self,
-        hours_since_trade: float,
-        trade_count: int,
-        signal_count: int
-    ) -> float:
-        """Calculate scarcity score 0-1 (higher = more scarce)."""
-        time_factor = min(1.0, hours_since_trade / 24)
+    def _check_cooldown(self, symbol: str, current_time: int) -> tuple[bool, str]:
+        """Check if cooldown period is in effect."""
+        last_time = self._last_trade_times.get(symbol)
+        if last_time is None:
+            return False, ""
         
-        expected_trades = self.MIN_DAILY_TRADES * (hours_since_trade / 24)
-        count_factor = 1.0 - min(1.0, trade_count / max(1, expected_trades))
+        elapsed = (current_time - last_time) / 1000
+        if elapsed < self.COOLDOWN_SECONDS:
+            return True, f"cooldown_{elapsed:.1f}s_remaining"
         
-        conversion_rate = (
-            trade_count / signal_count if signal_count > 0 else 0
-        )
-        conversion_factor = 1.0 - min(1.0, conversion_rate)
-        
-        score = time_factor * 0.4 + count_factor * 0.4 + conversion_factor * 0.2
-        
-        return min(1.0, max(0.0, score))
+        return False, ""
     
-    async def _reset_daily_counts_if_needed(self) -> None:
-        """Reset daily counters at start of new day."""
-        current_date = datetime.now().strftime('%Y-%m-%d')
+    def _check_rate_limits(self, current_time: int) -> tuple[bool, str]:
+        """Check if rate limits are exceeded."""
+        for limit in self.rate_limits:
+            window_start = current_time - limit.window_seconds * 1000
+            trades_in_window = sum(
+                1 for t in self._trade_history
+                if t.timestamp >= window_start
+            )
+            
+            if trades_in_window >= limit.max_trades:
+                return True, f"rate_limit_{limit.window_seconds}s_exceeded_{trades_in_window}/{limit.max_trades}"
+            
+            if trades_in_window >= limit.max_trades * self.WARNING_THRESHOLD:
+                logger.info(
+                    f"Rate limit warning: {trades_in_window}/{limit.max_trades} in {limit.window_seconds}s window"
+                )
         
-        if not hasattr(self, '_last_reset_date') or self._last_reset_date != current_date:
-            self._trade_count_today = 0
-            self._signal_count_today = 0
-            self._last_reset_date = current_date
+        return False, ""
+    
+    def _check_concentration(self, symbol: str) -> tuple[bool, str]:
+        """Check if symbol concentration is too high."""
+        if not self._symbol_trades_today:
+            return False, ""
+        
+        total_trades = sum(self._symbol_trades_today.values())
+        if total_trades == 0:
+            return False, ""
+        
+        symbol_trades = self._symbol_trades_today.get(symbol, 0)
+        concentration = symbol_trades / total_trades
+        
+        if concentration > self.MAX_CONCENTRATION:
+            return True, f"concentration_{concentration:.2%}_exceeds_{self.MAX_CONCENTRATION:.2%}"
+        
+        return False, ""
     
     async def record_trade(
         self,
         symbol: str,
         timestamp: int,
-        pnl: float = 0
+        outcome: Optional[str] = None
     ) -> None:
-        """Record a trade for scarcity tracking."""
-        self._last_trade_time = timestamp
-        self._trade_count_today += 1
+        """Record a trade for rate tracking."""
+        record = TradeRecord(symbol=symbol, timestamp=timestamp, outcome=outcome)
+        self._trade_history.append(record)
+        
+        self._last_trade_times[symbol] = timestamp
+        
+        if symbol not in self._symbol_trades_today:
+            self._symbol_trades_today[symbol] = 0
+        self._symbol_trades_today[symbol] += 1
         
         logger.debug(
-            f"Trade recorded for scarcity tracking: {symbol}",
+            f"Trade recorded: {symbol}",
             extra={
                 'symbol': symbol,
-                'pnl': pnl,
-                'daily_trade_count': self._trade_count_today,
+                'total_today': sum(self._symbol_trades_today.values()),
+                'symbol_today': self._symbol_trades_today[symbol],
             }
         )
     
-    async def record_signal(
-        self,
-        symbol: str,
-        timestamp: int,
-        was_accepted: bool
-    ) -> None:
-        """Record a signal for scarcity tracking."""
-        self._signal_count_today += 1
+    async def record_blocked(self, symbol: str, reason: str) -> None:
+        """Record a blocked trade."""
+        self._blocked_count += 1
         
-        if not was_accepted:
-            logger.debug(
-                f"Signal rejected for scarcity tracking: {symbol}",
-                extra={'symbol': symbol, 'daily_signal_count': self._signal_count_today}
-            )
-    
-    async def _record_scarcity_check(
-        self,
-        status: str,
-        score: float
-    ) -> None:
-        """Record scarcity check result."""
-        record = {
-            'status': status,
-            'score': score,
-            'trade_count': self._trade_count_today,
-            'signal_count': self._signal_count_today,
-            'timestamp': int(datetime.now().timestamp() * 1000),
-        }
-        
-        self._scarcity_history.append(record)
-        if len(self._scarcity_history) > 100:
-            self._scarcity_history = self._scarcity_history[-100:]
-        
-        await self._update_scarcity_state(status, score)
-    
-    async def _update_scarcity_state(
-        self,
-        status: str,
-        score: float
-    ) -> None:
-        if not self.state:
-            return
-            
-        await self.state.set(
-            key="scarcity:global",
-            value={
-                'status': status,
-                'score': score,
-                'trade_count_today': self._trade_count_today,
-                'signal_count_today': self._signal_count_today,
-                'last_trade_time': self._last_trade_time,
-                'updated_at': int(datetime.now().timestamp() * 1000),
-            },
-            trace_id="trade_scarcity_engine",
+        logger.debug(
+            f"Trade blocked: {symbol}",
+            extra={'symbol': symbol, 'reason': reason, 'blocked_count': self._blocked_count}
         )
     
-    async def _emit_scarcity_alert(
-        self,
-        status: str,
-        score: float,
-        recommendations: list[str]
-    ) -> None:
-        """Emit scarcity alert."""
-        logger.warning(
-            f"Trade scarcity {status}: score={score:.2f}",
-            extra={
-                'status': status,
-                'score': score,
-                'recommendations': recommendations,
-                'trade_count_today': self._trade_count_today,
-                'signal_count_today': self._signal_count_today,
-            }
-        )
+    async def _reset_daily_counts_if_needed(self) -> None:
+        """Reset daily counters at start of new day."""
+        current_date = datetime.now().strftime('%Y-%m-%d')
         
-        if self.bus:
-            alert_event = Event.create(
-                event_type=EventType.RATE_LIMIT_APPLIED,
-                payload={
-                    'reason': 'trade_scarcity',
-                    'status': status,
-                    'score': score,
-                    'recommendations': recommendations,
-                },
-                source="trade_scarcity_engine",
-            )
-            await self.bus.publish(alert_event)
+        if self._last_reset_date != current_date:
+            self._symbol_trades_today = {}
+            self._last_reset_date = current_date
     
-    async def get_scarcity_report(self) -> dict:
-        """Get comprehensive scarcity report."""
-        avg_score = (
-            sum(s['score'] for s in self._scarcity_history) / len(self._scarcity_history)
-            if self._scarcity_history else 0
-        )
+    def get_rate_stats(self, window_seconds: int = 3600) -> dict:
+        """Get rate statistics for a time window."""
+        current_time = int(datetime.now().timestamp() * 1000)
+        window_start = current_time - window_seconds * 1000
+        
+        trades_in_window = [
+            t for t in self._trade_history
+            if t.timestamp >= window_start
+        ]
+        
+        symbol_counts = {}
+        for t in trades_in_window:
+            symbol_counts[t.symbol] = symbol_counts.get(t.symbol, 0) + 1
         
         return {
-            'current_score': self._scarcity_history[-1]['score'] if self._scarcity_history else 0,
-            'average_score': avg_score,
-            'status': self._scarcity_history[-1]['status'] if self._scarcity_history else 'OK',
-            'trade_count_today': self._trade_count_today,
-            'signal_count_today': self._signal_count_today,
-            'last_trade_time': self._last_trade_time,
-            'scarcity_events': len([s for s in self._scarcity_history if s['status'] != 'OK']),
+            'window_seconds': window_seconds,
+            'trade_count': len(trades_in_window),
+            'unique_symbols': len(symbol_counts),
+            'top_symbol': max(symbol_counts.items(), key=lambda x: x[1])[0] if symbol_counts else None,
+            'symbol_distribution': symbol_counts,
+            'block_rate': self._blocked_count / max(1, self._total_check_count),
         }
     
-    async def should_relax_filters(self) -> tuple[bool, float]:
-        """
-        Determine if filters should be temporarily relaxed.
+    async def get_governor_report(self) -> dict:
+        """Get comprehensive rate governor report."""
+        stats_1m = self.get_rate_stats(60)
+        stats_5m = self.get_rate_stats(300)
+        stats_1h = self.get_rate_stats(3600)
         
-        Returns:
-            (should_relax, relaxation_factor)
-        """
-        if not self._scarcity_history:
-            return False, 0.0
+        return {
+            'blocked_count': self._blocked_count,
+            'total_checks': self._total_check_count,
+            'block_rate': self._blocked_count / max(1, self._total_check_count),
+            'trades_1m': stats_1m['trade_count'],
+            'trades_5m': stats_5m['trade_count'],
+            'trades_1h': stats_1h['trade_count'],
+            'symbol_concentration': self._symbol_trades_today.copy(),
+            'cooldown_seconds': self.COOLDOWN_SECONDS,
+        }
+    
+    async def update_state(self) -> None:
+        """Persist governor state."""
+        if not self.state:
+            return
         
-        recent = self._scarcity_history[-5:]
-        avg_score = sum(s['score'] for s in recent) / len(recent)
-        
-        if avg_score > 0.7:
-            return True, 0.3
-        elif avg_score > 0.5:
-            return True, 0.15
-        elif avg_score > 0.3:
-            return True, 0.1
-        
-        return False, 0.0
+        await self.state.set(
+            key="governor:trade_rate",
+            value={
+                'blocked_count': self._blocked_count,
+                'total_checks': self._total_check_count,
+                'symbol_trades_today': self._symbol_trades_today.copy(),
+                'last_trade_times': self._last_trade_times.copy(),
+                'updated_at': int(datetime.now().timestamp() * 1000),
+            },
+            trace_id="trade_rate_governor",
+        )
+
+
+from typing import Optional

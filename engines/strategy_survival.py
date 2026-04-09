@@ -76,7 +76,14 @@ class StrategySurvivalEngine:
             'consistency': self._evaluate_consistency(),
         }
         
-        self._survival_score = sum(survival_factors.values()) / len(survival_factors)
+        survival_values = list(survival_factors.values())
+        if any(v == 0 for v in survival_values):
+            self._survival_score = 0.0
+        else:
+            product = 1.0
+            for v in survival_values:
+                product *= v
+            self._survival_score = max(0.0, min(1.0, product))
         
         protective_actions = []
         status = "HEALTHY"

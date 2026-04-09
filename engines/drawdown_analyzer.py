@@ -5,9 +5,11 @@ Monitors portfolio drawdown and initiates risk controls when thresholds breached
 """
 
 import logging
+import numpy as np
 from typing import Optional
 from dataclasses import asdict
 from datetime import datetime
+from collections import deque
 
 from core.event import Event, EventType
 from core.bus import EventBus
@@ -25,11 +27,16 @@ class DrawdownAnalyzer:
     - Peak-to-trough
     - Drawdown duration
     - Recovery time
+    - Accelerating drawdown detection
+    - Spiky loss detection
     """
     
     SOFT_LIMIT_PCT = 0.10
     HARD_LIMIT_PCT = 0.20
     DRAWDOWN_RATE_ALERT = 0.05
+    ACCELERATION_WINDOW = 5
+    SPIKE_ZSCORE_THRESHOLD = 3.0
+    SPIKE_WINDOW = 10
     
     def __init__(
         self,
@@ -47,6 +54,11 @@ class DrawdownAnalyzer:
         self._drawdown_start: Optional[datetime] = None
         self._drawdown_history: list[dict] = []
         self._consecutive_losses: int = 0
+        
+        self._drawdown_rates = deque(maxlen=self.ACCELERATION_WINDOW * 2)
+        self._period_returns = deque(maxlen=self.SPIKE_WINDOW * 2)
+        self._acceleration_detected = False
+        self._spike_detected = False
         
     async def update_drawdown(
         self,
@@ -116,9 +128,80 @@ class DrawdownAnalyzer:
         if self._consecutive_losses >= 5:
             required_actions.append("review_strategy")
         
+        self._update_rate_history(drawdown_rate)
+        
+        if self._detect_accelerating_drawdown():
+            if not self._acceleration_detected:
+                self._acceleration_detected = True
+                required_actions.append("acceleration_detected")
+                logger.warning(
+                    f"Accelerating drawdown detected: rate={drawdown_rate:.4f}"
+                )
+            required_actions.append("increase_reserves")
+        
+        if self._detect_spiky_losses():
+            if not self._spike_detected:
+                self._spike_detected = True
+                required_actions.append("spiky_losses_detected")
+                logger.warning("Spiky loss pattern detected")
+            required_actions.append("volatility_exit")
+        
+        if drawdown_pct < self.SOFT_LIMIT_PCT:
+            self._acceleration_detected = False
+            self._spike_detected = False
+        
         await self._update_drawdown_state(drawdown_pct, status)
         
         return status, required_actions
+    
+    def _update_rate_history(self, rate: float) -> None:
+        """Update drawdown rate history for acceleration detection."""
+        self._drawdown_rates.append(rate)
+    
+    def _detect_accelerating_drawdown(self) -> bool:
+        """
+        Detect if drawdown rate is increasing over multiple periods.
+        
+        Compares recent average rate to historical average.
+        Returns True if recent rate is significantly worse (>20% faster).
+        """
+        if len(self._drawdown_rates) < self.ACCELERATION_WINDOW:
+            return False
+        
+        rates = list(self._drawdown_rates)
+        recent_avg = np.mean(rates[-2:]) if len(rates) >= 2 else rates[-1]
+        historical_avg = np.mean(rates[:-2]) if len(rates) > 2 else np.mean(rates)
+        
+        if abs(historical_avg) < 1e-10:
+            return False
+        
+        acceleration_ratio = recent_avg / historical_avg
+        
+        return acceleration_ratio < 0.8
+    
+    def _detect_spiky_losses(self) -> bool:
+        """
+        Detect abnormal loss spikes using z-score.
+        
+        Returns True if any return is > 3 standard deviations from mean.
+        """
+        if len(self._period_returns) < self.SPIKE_WINDOW:
+            return False
+        
+        returns = list(self._period_returns)
+        mean = np.mean(returns)
+        std = np.std(returns)
+        
+        if std < 1e-10:
+            return False
+        
+        z_scores = [(r - mean) / std for r in returns]
+        
+        return any(z < -self.SPIKE_ZSCORE_THRESHOLD for z in z_scores)
+    
+    def record_return(self, period_return: float) -> None:
+        """Record a period return for spike detection."""
+        self._period_returns.append(period_return)
     
     def _calculate_drawdown_duration(self) -> int:
         """Calculate duration of current drawdown in seconds."""

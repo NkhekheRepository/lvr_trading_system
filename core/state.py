@@ -183,11 +183,13 @@ class DistributedState:
         version: Optional[int] = None,
         updated_by: Optional[str] = None,
         trace_id: Optional[str] = None,
+        use_serializable: bool = True,
     ) -> StateValue:
         """
         Set value atomically with version check.
         
         If version is provided, uses optimistic locking.
+        If use_serializable is True (default), uses SERIALIZABLE isolation level.
         """
         async with self._lock:
             if version is not None:
@@ -201,16 +203,20 @@ class DistributedState:
             updated_at = datetime.utcnow()
             
             async with self._pg_pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO state (key, value, version, updated_at, updated_by, trace_id)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (key) DO UPDATE SET
-                        value = EXCLUDED.value,
-                        version = EXCLUDED.version,
-                        updated_at = EXCLUDED.updated_at,
-                        updated_by = EXCLUDED.updated_by,
-                        trace_id = EXCLUDED.trace_id
-                """, key, json.dumps(value), new_version, updated_at, updated_by, trace_id)
+                if use_serializable:
+                    await conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                
+                async with conn.transaction():
+                    await conn.execute("""
+                        INSERT INTO state (key, value, version, updated_at, updated_by, trace_id)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        ON CONFLICT (key) DO UPDATE SET
+                            value = EXCLUDED.value,
+                            version = EXCLUDED.version,
+                            updated_at = EXCLUDED.updated_at,
+                            updated_by = EXCLUDED.updated_by,
+                            trace_id = EXCLUDED.trace_id
+                    """, key, json.dumps(value), new_version, updated_at, updated_by, trace_id)
                 
             await self._cache_to_redis(key, {
                 'key': key,
@@ -237,12 +243,19 @@ class DistributedState:
         max_retries: int = 3,
         updated_by: Optional[str] = None,
         trace_id: Optional[str] = None,
+        use_pessimistic_locking: bool = False,
     ) -> StateValue:
         """
         Atomically update value using a function.
         
-        Implements optimistic locking with retry.
+        If use_pessimistic_locking is True, uses SELECT FOR UPDATE.
+        Otherwise, uses optimistic locking with retry.
         """
+        if use_pessimistic_locking:
+            return await self._atomic_update_pessimistic(
+                key, update_fn, updated_by, trace_id
+            )
+        
         for attempt in range(max_retries):
             current = await self.get(key)
             current_value = current.value if current else None
@@ -267,6 +280,61 @@ class DistributedState:
                 raise
                 
         raise RuntimeError("atomic_update failed after max retries")
+    
+    async def _atomic_update_pessimistic(
+        self,
+        key: str,
+        update_fn: Callable[[Any], Any],
+        updated_by: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> StateValue:
+        """Atomic update using row-level locking with SELECT FOR UPDATE."""
+        async with self._pg_pool.acquire() as conn:
+            await conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            
+            async with conn.transaction():
+                row = await conn.fetchrow("""
+                    SELECT * FROM state WHERE key = $1 FOR UPDATE
+                """, key)
+                
+                current_value = row['value'] if row else None
+                
+                try:
+                    new_value = update_fn(current_value)
+                except Exception as e:
+                    raise ValueError(f"Update function failed: {e}")
+                
+                new_version = (row['version'] if row else 0) + 1
+                updated_at = datetime.utcnow()
+                
+                await conn.execute("""
+                    INSERT INTO state (key, value, version, updated_at, updated_by, trace_id)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (key) DO UPDATE SET
+                        value = EXCLUDED.value,
+                        version = EXCLUDED.version,
+                        updated_at = EXCLUDED.updated_at,
+                        updated_by = EXCLUDED.updated_by,
+                        trace_id = EXCLUDED.trace_id
+                """, key, json.dumps(new_value), new_version, updated_at, updated_by, trace_id)
+                
+                await self._cache_to_redis(key, {
+                    'key': key,
+                    'value': new_value,
+                    'version': new_version,
+                    'updated_at': updated_at.isoformat(),
+                    'updated_by': updated_by,
+                    'trace_id': trace_id,
+                })
+                
+                return StateValue(
+                    key=key,
+                    value=new_value,
+                    version=new_version,
+                    updated_at=updated_at,
+                    updated_by=updated_by,
+                    trace_id=trace_id,
+                )
         
     async def delete(self, key: str) -> bool:
         """Delete a key from both stores."""
@@ -348,8 +416,9 @@ class PositionState:
         price: float,
         realized_pnl_delta: float = 0.0,
         trace_id: Optional[str] = None,
+        use_pessimistic_locking: bool = True,
     ) -> dict:
-        """Atomically update position."""
+        """Atomically update position with row-level locking."""
         
         def update_fn(current: Optional[dict]) -> dict:
             if current is None:
@@ -380,6 +449,7 @@ class PositionState:
             key=f"position:{symbol}",
             update_fn=update_fn,
             trace_id=trace_id,
+            use_pessimistic_locking=use_pessimistic_locking,
         )
         
         return result.value

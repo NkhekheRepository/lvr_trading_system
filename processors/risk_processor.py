@@ -32,9 +32,9 @@ class RiskProcessor(BaseProcessor):
     - Required actions (reduce positions, halt)
     """
     
-    MAX_LEVERAGE = 3.0
-    MAX_DRAWDOWN_PCT = 0.15
-    MAX_DAILY_LOSS_PCT = 0.05
+    MAX_LEVERAGE = 10.0
+    MAX_DRAWDOWN_PCT = 0.10
+    MAX_DAILY_LOSS_PCT = 0.03
     MAX_POSITION_SIZE_PCT = 0.25
     
     def __init__(

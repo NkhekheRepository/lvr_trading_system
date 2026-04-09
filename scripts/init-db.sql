@@ -20,6 +20,7 @@ CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_symbol ON events(symbol);
 CREATE INDEX IF NOT EXISTS idx_events_trace ON events(trace_id);
 CREATE INDEX IF NOT EXISTS idx_events_offset ON events(offset);
+CREATE INDEX IF NOT EXISTS idx_events_symbol_offset ON events(symbol, offset);
 
 -- State snapshots for replay
 CREATE TABLE IF NOT EXISTS state_snapshots (

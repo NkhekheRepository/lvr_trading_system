@@ -30,8 +30,8 @@ class PositiveExpectationEngine(BaseProcessor):
     """
     
     MIN_EDGE_THRESHOLD = 0.0001
-    MAX_COST_EDGE_RATIO = 10.0
-    MIN_PAYOFF_RATIO = 1.0
+    MAX_COST_EDGE_RATIO = 0.5
+    MIN_PAYOFF_RATIO = 1.5
     
     def __init__(
         self,
