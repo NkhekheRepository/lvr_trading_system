@@ -1,5 +1,7 @@
 """
 Pydantic schemas for the LVR Trading System.
+
+Note: Core event types are imported from core.event to ensure consistency.
 """
 
 from __future__ import annotations
@@ -10,6 +12,22 @@ from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+try:
+    from core.event import EventType as CoreEventType
+    EventType = CoreEventType
+except ImportError:
+    class EventType(str, Enum):
+        MARKET = "market"
+        SIGNAL = "signal"
+        ORDER_SUBMIT = "order_submit"
+        ORDER_UPDATE = "order_update"
+        FILL = "fill"
+        REJECT = "reject"
+        CANCEL = "cancel"
+        RISK_CHECK = "risk_check"
+        PROTECTION = "protection"
+        STATE_UPDATE = "state_update"
 
 
 class Side(str, Enum):
@@ -428,19 +446,6 @@ class Alert(BaseModel):
     source_module: str
     trace_id: Optional[str] = None
     acknowledged: bool = False
-
-
-class EventType(str, Enum):
-    MARKET = "market"
-    SIGNAL = "signal"
-    ORDER_SUBMIT = "order_submit"
-    ORDER_UPDATE = "order_update"
-    FILL = "fill"
-    REJECT = "reject"
-    CANCEL = "cancel"
-    RISK_CHECK = "risk_check"
-    PROTECTION = "protection"
-    STATE_UPDATE = "state_update"
 
 
 class SystemEvent(BaseModel):
