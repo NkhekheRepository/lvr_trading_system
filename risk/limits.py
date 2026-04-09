@@ -1,5 +1,38 @@
 """
 Risk limits and breach detection.
+
+This module implements the risk management layer with comprehensive
+limit checking and multi-level protection mechanisms. The RiskEngine
+provides defense-in-depth by checking multiple risk metrics and
+implementing graduated protection responses.
+
+Protection Levels (escalating):
+    NONE: Normal operation, no restrictions.
+    REDUCE_SIZE: Reduce position sizes by 50%.
+    RESTRICT_TRADING: Block new orders, allow existing positions.
+    CLOSE_ALL_HALT: Close all positions and halt trading (manual restart required).
+
+Hard Limits:
+    - Maximum leverage: 10x default
+    - Maximum drawdown: 10% default
+    - Maximum daily loss: 3% default
+    - Maximum position size: 20% of capital
+
+Soft Limits (warnings + adjustments):
+    - Position size warning: 15%
+    - Daily loss warning: 2%
+    - Consecutive loss warning: 3 trades
+
+Example:
+    >>> from risk.limits import RiskEngine, RiskLimits
+    >>> limits = RiskLimits(max_leverage=5.0, max_drawdown_pct=0.05)
+    >>> engine = RiskEngine(limits)
+    >>> 
+    >>> result = engine.check_order(order, signal, portfolio, risk_state)
+    >>> if not result.approved:
+    ...     print(f"Rejected: {result.rejection_reason}")
+    >>> for action in result.required_actions:
+    ...     print(f"Action: {action}")
 """
 
 import logging
@@ -17,7 +50,23 @@ EPS = 1e-10
 
 @dataclass
 class RiskLimits:
-    """Risk limit configuration."""
+    """
+    Risk limit configuration.
+    
+    Defines all configurable risk parameters for the trading system.
+    Hard limits trigger immediate rejections or actions; soft limits
+    trigger warnings and size adjustments.
+    
+    Attributes:
+        max_leverage: Maximum allowed leverage (e.g., 10.0 = 10x).
+        max_drawdown_pct: Maximum drawdown before halt (e.g., 0.10 = 10%).
+        max_daily_loss_pct: Maximum daily loss before halt (e.g., 0.03 = 3%).
+        max_position_size_pct: Maximum position as % of capital (e.g., 0.20 = 20%).
+        max_consecutive_losses: Max losing trades before restrictions.
+        position_warning_pct: Position size warning threshold.
+        daily_loss_warning_pct: Daily loss warning threshold.
+        consecutive_loss_warning: Consecutive loss warning threshold.
+    """
     max_leverage: float = 10.0
     max_drawdown_pct: float = 0.10
     max_daily_loss_pct: float = 0.03
@@ -33,11 +82,38 @@ class RiskEngine:
     """
     Risk management engine with limit checking.
     
-    Hard limits trigger immediate action.
-    Soft limits trigger warnings and size reduction.
+    Implements defense-in-depth risk management with graduated
+    protection levels. Hard limits trigger immediate action;
+    soft limits trigger warnings and position size reduction.
+    
+    Protection Level Escalation:
+        1. Normal operation (ProtectionLevel.NONE)
+        2. Reduce sizes by 50% (ProtectionLevel.REDUCE_SIZE)
+        3. Restrict new trading (ProtectionLevel.RESTRICT_TRADING)
+        4. Close all, halt (ProtectionLevel.CLOSE_ALL_HALT)
+    
+    Attributes:
+        limits: RiskLimits configuration.
+        protection_level: Current protection level.
+        is_halted: True if system is halted.
+    
+    Example:
+        >>> engine = RiskEngine(RiskLimits(max_drawdown_pct=0.05))
+        >>> result = engine.check_order(order, signal, portfolio, risk_state)
+        >>> 
+        >>> engine.record_trade_result(pnl=-100)
+        >>> engine.record_trade_result(pnl=-50)
+        >>> engine.record_trade_result(pnl=-75)
+        >>> level = engine.evaluate_protection_level(portfolio)
     """
 
     def __init__(self, limits: RiskLimits = None):
+        """
+        Initialize risk engine.
+        
+        Args:
+            limits: RiskLimits configuration. Uses defaults if None.
+        """
         self.limits = limits or RiskLimits()
 
         self._consecutive_losses = 0
@@ -46,10 +122,24 @@ class RiskEngine:
 
     @property
     def protection_level(self) -> ProtectionLevel:
+        """
+        Get current protection level.
+        
+        Returns:
+            Current ProtectionLevel enum value.
+        """
         return self._protection_level
 
     @property
     def is_halted(self) -> bool:
+        """
+        Check if system is halted.
+        
+        Halted systems reject all new orders until manually restarted.
+        
+        Returns:
+            True if system is halted, False otherwise.
+        """
         return self._halted
 
     def check_order(
@@ -59,7 +149,34 @@ class RiskEngine:
         portfolio: Portfolio,
         risk_state: RiskState
     ) -> RiskCheckResult:
-        """Check if order passes risk limits."""
+        """
+        Check if order passes risk limits.
+        
+        Performs comprehensive risk checks including leverage, drawdown,
+        daily loss, position size, and protection level restrictions.
+        
+        Args:
+            order: OrderRequest to check.
+            signal: Signal generating the order.
+            portfolio: Current portfolio state.
+            risk_state: Current risk state (modified in place).
+        
+        Returns:
+            RiskCheckResult containing:
+            - approved: Whether order is allowed
+            - risk_state: Updated risk state
+            - adjusted_quantity: Modified quantity if size reduced
+            - rejection_reason: Reason if not approved
+            - required_actions: List of actions taken/adjustments
+        
+        Checks Performed:
+            1. Halt check: Reject if system is halted
+            2. Leverage check: Reject if exceeds max_leverage
+            3. Drawdown check: Reject if exceeds max_drawdown_pct
+            4. Daily loss check: Reject if exceeds max_daily_loss_pct
+            5. Position size check: Adjust if exceeds max_position_size_pct
+            6. Protection level check: Apply size reduction if active
+        """
         if self._halted:
             return RiskCheckResult(
                 approved=False,
@@ -106,7 +223,27 @@ class RiskEngine:
         )
 
     def _update_risk_state(self, portfolio: Portfolio, risk_state: RiskState) -> RiskState:
-        """Update risk state from portfolio."""
+        """
+        Update risk state from portfolio.
+        
+        Computes current risk metrics from portfolio state and
+        updates the risk_state object with pass/fail flags.
+        
+        Args:
+            portfolio: Portfolio to extract metrics from.
+            risk_state: RiskState to update (modified in place).
+        
+        Returns:
+            Updated risk_state object.
+        
+        Computed Metrics:
+            - current_leverage: From portfolio.portfolio_leverage
+            - current_drawdown: From portfolio.current_drawdown
+            - daily_loss: portfolio.daily_pnl / portfolio.initial_capital
+            - leverage_ok: current_leverage <= max_leverage
+            - drawdown_ok: current_drawdown <= max_drawdown_pct
+            - daily_loss_ok: daily_loss >= -max_daily_loss_pct
+        """
         risk_state.current_leverage = portfolio.portfolio_leverage
         risk_state.current_drawdown = portfolio.current_drawdown
         risk_state.daily_loss = portfolio.daily_pnl / portfolio.initial_capital
@@ -121,7 +258,17 @@ class RiskEngine:
         return risk_state
 
     def record_trade_result(self, pnl: float) -> None:
-        """Record trade result for loss tracking."""
+        """
+        Record trade result for loss tracking.
+        
+        Tracks consecutive wins/losses for protection level evaluation.
+        
+        Args:
+            pnl: Trade profit/loss amount. Positive = win, negative = loss.
+        
+        Side Effects:
+            Increments _consecutive_losses on loss, resets on win.
+        """
         if pnl < 0:
             self._consecutive_losses += 1
         else:
@@ -130,7 +277,27 @@ class RiskEngine:
         logger.info(f"Trade result: PnL={pnl:.2f}, consecutive losses={self._consecutive_losses}")
 
     def evaluate_protection_level(self, portfolio: Portfolio) -> ProtectionLevel:
-        """Evaluate required protection level based on conditions."""
+        """
+        Evaluate required protection level based on conditions.
+        
+        Checks all risk metrics and determines the appropriate
+        protection level. Protection level only increases, never
+        decreases (requires manual intervention).
+        
+        Args:
+            portfolio: Current portfolio state for evaluation.
+        
+        Returns:
+            New protection level (may be same as current if conditions
+            haven't worsened).
+        
+        Escalation Triggers:
+            - Drawdown > 80% of max: RESTRICT_TRADING
+            - Drawdown > 100% of max: CLOSE_ALL_HALT
+            - Daily loss > 100% of max: CLOSE_ALL_HALT
+            - Consecutive losses >= warning threshold: REDUCE_SIZE
+            - Consecutive losses >= max: RESTRICT_TRADING
+        """
         new_level = ProtectionLevel.NONE
 
         if portfolio.current_drawdown > self.limits.max_drawdown_pct:
@@ -153,7 +320,23 @@ class RiskEngine:
         return self._protection_level
 
     def apply_protection_action(self, action: ProtectionLevel) -> list[str]:
-        """Apply protection action and return actions taken."""
+        """
+        Apply protection action and return actions taken.
+        
+        Translates protection level to concrete actions. Called
+        internally when protection level changes.
+        
+        Args:
+            action: ProtectionLevel to apply.
+        
+        Returns:
+            List of action descriptions taken.
+        
+        Action Mapping:
+            REDUCE_SIZE: Reduce position sizes by 50%
+            RESTRICT_TRADING: Restrict orders, block volatility
+            CLOSE_ALL_HALT: Close positions, halt system
+        """
         actions = []
 
         if action == ProtectionLevel.REDUCE_SIZE:
@@ -173,14 +356,31 @@ class RiskEngine:
         return actions
 
     def reset(self) -> None:
-        """Reset risk engine state."""
+        """
+        Reset risk engine state.
+        
+        Resets all counters and protection levels to initial state.
+        Does NOT unhalt the system (use unhalt() for that).
+        """
         self._consecutive_losses = 0
         self._protection_level = ProtectionLevel.NONE
         self._halted = False
         logger.info("Risk engine reset")
 
     def unhalt(self) -> bool:
-        """Unhalt system (manual restart required)."""
+        """
+        Unhalt system (manual restart required).
+        
+        Called after manual review to restart trading after a halt.
+        Resets all protection state and loss counters.
+        
+        Returns:
+            True (system is now unhalted).
+        
+        Warning:
+            This should only be called after manual review of why
+            the halt was triggered and appropriate corrective action.
+        """
         if not self._halted:
             return True
 
