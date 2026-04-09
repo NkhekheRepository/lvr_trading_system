@@ -1,0 +1,108 @@
+system:
+  name: lvr_trading_system
+  version: 1.0.0
+  mode: SIM
+  environment: development
+  log_level: INFO
+  log_dir: logs
+  live_confirm_required: true
+
+exchange:
+  name: binance_futures
+  testnet: true
+  rate_limits:
+    orders_per_second: 10
+    requests_per_second: 120
+    max_open_orders: 50
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+
+execution:
+  slippage_alpha: 0.5
+  simulated_latency_ms: 100
+  modes:
+    SIM:
+      deterministic_fills: true
+      zero_slippage: false
+    PAPER:
+      use_real_market_data: true
+      slippage_multiplier: 1.0
+    LIVE:
+      use_vnpy: true
+      slippage_multiplier: 1.5
+  fees:
+    maker: 0.00020
+    taker: 0.00040
+
+risk:
+  base_risk_per_trade: 0.01
+  max_leverage: 10
+  limits:
+    max_drawdown_pct: 0.10
+    max_daily_loss_pct: 0.03
+    max_position_size_pct: 0.20
+    max_correlation: 0.7
+  soft_limits:
+    position_warning_pct: 0.15
+    daily_loss_warning_pct: 0.02
+    consecutive_losses: 3
+
+features:
+  return_window: 50
+  volatility_window: 100
+  depth_window: 100
+  spread_window: 100
+  zscore_threshold: 3.0
+
+strategy:
+  ofi_threshold: 0.7
+  regime_threshold: 2.0
+  signal_decay: 0.95
+  min_confidence: 0.3
+  reversal_window: 5
+  reversal_required: true
+
+portfolio:
+  initial_capital: 100000.0
+  currency: USDT
+  rebalance_threshold: 0.05
+
+learning:
+  min_samples: 30
+  update_rate: 0.1
+  max_change_per_update: 0.05
+  cooldown_ticks: 10
+  edge_threshold: 0.001
+
+monitoring:
+  collection_interval: 1.0
+  alerts:
+    slack_webhook: ""
+    email_recipients: []
+    rate_limit_per_minute: 10
+  health_check_interval: 5.0
+  data_freshness_threshold_sec: 10
+
+state:
+  checkpoint_interval_sec: 60
+  event_log_enabled: true
+  event_retention_days: 90
+  auto_recovery: true
+  validate_on_startup: true
+
+database:
+  host: localhost
+  port: 5432
+  name: trading_system
+  user: trading_user
+  pool_size: 10
+  max_overflow: 20
+
+redis:
+  host: localhost
+  port: 6379
+  db: 0
+  password: ""
+  pool_size: 10
+  socket_timeout: 5

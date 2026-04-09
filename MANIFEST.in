@@ -1,0 +1,9 @@
+include README.md
+include requirements.txt
+include .env.example
+include .gitignore
+recursive-include config *.yaml
+recursive-include infrastructure *.sql *.sh *.service
+recursive-include tests *.py
+recursive-exclude __pycache__ *
+recursive-exclude *.pyc

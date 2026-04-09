@@ -1,0 +1,27 @@
+[Unit]
+Description=LVR Trading System
+After=network.target postgresql.service redis.service
+Wants=postgresql.service redis.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/lvr_trading_system
+Environment=PYTHONPATH=/home/ubuntu/lvr_trading_system
+Environment=LVR_ENV=production
+ExecStart=/usr/bin/python3 /home/ubuntu/lvr_trading_system/app/main.py /home/ubuntu/lvr_trading_system/config/config.yaml
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lvr-trading
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/home/ubuntu/lvr_trading_system/logs
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
