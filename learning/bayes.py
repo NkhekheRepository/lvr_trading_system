@@ -449,3 +449,227 @@ class AdaptiveLearner(BayesianLearner):
         current = self._regime_multipliers[regime]
         adjustment = 0.1 * (performance - 1.0)
         self._regime_multipliers[regime] = np.clip(current + adjustment, 0.5, 2.0)
+
+
+class DriftDetector:
+    """
+    Concept Drift Detection for Trading Models
+    
+    Detects changes in the statistical properties of trade outcomes
+    that may indicate model degradation or market regime changes.
+    
+    DETECTION METHODS:
+    1. ADWIN (Adaptive Windowing): Detects changes in streaming data
+    2. CUSUM: Cumulative sum for abrupt changes
+    3. Page-Hinkley: Sequential change detection
+    
+    RESPONSE ACTIONS:
+    - Alert: Log warning for monitoring
+    - Reduce confidence: Lower confidence until more data
+    - Reset: Reset model state if severe drift detected
+    - Pause: Temporarily pause trading
+    
+    Usage:
+        >>> detector = DriftDetector(window_size=100, threshold=0.05)
+        >>> 
+        >>> # After each trade
+        >>> drift_info = detector.update(is_win)
+        >>> if drift_info.detected:
+        ...     learner.reset(symbol)  # Reset learning
+    """
+    
+    def __init__(
+        self,
+        window_size: int = 100,
+        adwin_delta: float = 0.002,
+        cusum_threshold: float = 5.0,
+        page_hinkley_threshold: float = 50.0,
+        alert_threshold: float = 0.01,
+        confidence_decay_rate: float = 0.95,
+    ):
+        self.window_size = window_size
+        self.adwin_delta = adwin_delta
+        self.cusum_threshold = cusum_threshold
+        self.page_hinkley_threshold = page_hinkley_threshold
+        self.alert_threshold = alert_threshold
+        self.confidence_decay_rate = confidence_decay_rate
+        
+        self._window: list = []
+        self._mean: float = 0.5
+        self._variance: float = 0.25
+        
+        self._cusum_pos: float = 0.0
+        self._cusum_neg: float = 0.0
+        
+        self._ph_sum: float = 0.0
+        self._ph_mean: float = 0.0
+        
+        self._drift_detected: bool = False
+        self._drift_count: int = 0
+        self._last_drift_tick: int = 0
+        
+        self._confidence: float = 1.0
+        self._tick: int = 0
+    
+    @property
+    def confidence(self) -> float:
+        """Get current confidence level (decays with drift)."""
+        return self._confidence
+    
+    @property
+    def drift_detected(self) -> bool:
+        """Check if drift was recently detected."""
+        return self._drift_detected
+    
+    def update(self, value: float) -> DriftInfo:
+        """
+        Update drift detector with new observation.
+        
+        Args:
+            value: Binary value (0 or 1) or continuous value
+            
+        Returns:
+            DriftInfo with detection results
+        """
+        self._tick += 1
+        
+        self._window.append(value)
+        if len(self._window) > self.window_size:
+            self._window.pop(0)
+        
+        old_mean = self._mean
+        self._mean = sum(self._window) / len(self._window)
+        
+        if len(self._window) > 1:
+            self._variance = sum((x - self._mean) ** 2 for x in self._window) / len(self._window)
+        
+        drift_detected = False
+        drift_type = None
+        drift_severity = 0.0
+        
+        adwin_change = self._check_adwin()
+        if adwin_change:
+            drift_detected = True
+            drift_type = "adwin"
+            drift_severity = abs(self._mean - old_mean) / (old_mean + 1e-10)
+        
+        cusum_change = self._check_cusum(value)
+        if cusum_change:
+            drift_detected = True
+            drift_type = "cusum"
+            drift_severity = 0.1
+        
+        ph_change = self._check_page_hinkley(value)
+        if ph_change:
+            drift_detected = True
+            drift_type = "page_hinkley"
+            drift_severity = 0.05
+        
+        if drift_detected:
+            self._drift_count += 1
+            self._last_drift_tick = self._tick
+            self._confidence *= self.confidence_decay_rate
+            self._confidence = max(0.1, self._confidence)
+        else:
+            self._confidence = min(1.0, self._confidence + 0.01)
+        
+        self._drift_detected = drift_detected
+        
+        return DriftInfo(
+            detected=drift_detected,
+            drift_type=drift_type,
+            drift_severity=drift_severity,
+            current_mean=self._mean,
+            current_variance=self._variance,
+            confidence=self._confidence,
+            drift_count=self._drift_count,
+        )
+    
+    def _check_adwin(self) -> bool:
+        """
+        ADWIN change detection.
+        
+        Compares recent window mean to older window mean.
+        """
+        if len(self._window) < self.window_size // 2:
+            return False
+        
+        mid = len(self._window) // 2
+        recent = self._window[mid:]
+        older = self._window[:mid]
+        
+        recent_mean = sum(recent) / len(recent)
+        older_mean = sum(older) / len(older)
+        
+        change = abs(recent_mean - older_mean)
+        return change > self.alert_threshold
+    
+    def _check_cusum(self, value: float) -> bool:
+        """
+        CUSUM change detection.
+        
+        Tracks cumulative deviations from expected mean.
+        """
+        target = 0.5
+        delta = value - target
+        
+        self._cusum_pos = max(0, self._cusum_pos + delta - 0.01)
+        self._cusum_neg = max(0, self._cusum_neg - delta - 0.01)
+        
+        return max(self._cusum_pos, self._cusum_neg) > self.cusum_threshold
+    
+    def _check_page_hinkley(self, value: float) -> bool:
+        """
+        Page-Hinkley change detection.
+        
+        Sequential test for change in mean.
+        """
+        if self._tick == 1:
+            self._ph_mean = value
+            return False
+        
+        delta = value - self._ph_mean
+        self._ph_sum += delta - 0.005
+        self._ph_mean = 0.005 * value + 0.995 * self._ph_mean
+        
+        return abs(self._ph_sum) > self.page_hinkley_threshold
+    
+    def reset(self) -> None:
+        """Reset drift detector state."""
+        self._window.clear()
+        self._mean = 0.5
+        self._variance = 0.25
+        self._cusum_pos = 0.0
+        self._cusum_neg = 0.0
+        self._ph_sum = 0.0
+        self._ph_mean = 0.0
+        self._drift_detected = False
+        self._confidence = 1.0
+        self._tick = 0
+    
+    def get_stats(self) -> dict:
+        """Get detector statistics."""
+        return {
+            "mean": self._mean,
+            "variance": self._variance,
+            "confidence": self._confidence,
+            "drift_count": self._drift_count,
+            "window_size": len(self._window),
+            "cusum_pos": self._cusum_pos,
+            "cusum_neg": self._cusum_neg,
+        }
+
+
+@dataclass
+class DriftInfo:
+    """Results from drift detection check."""
+    detected: bool
+    drift_type: Optional[str]
+    drift_severity: float
+    current_mean: float
+    current_variance: float
+    confidence: float
+    drift_count: int
+
+
+from dataclasses import dataclass

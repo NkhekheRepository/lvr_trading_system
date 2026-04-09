@@ -186,20 +186,6 @@ class PortfolioManager:
             pos: Position to update.
             fill: Sell fill event.
         """
-        if pos.quantity >= 0:
-            total_cost = pos.entry_price * pos.quantity + fill.price * fill.quantity
-            new_qty = pos.quantity + fill.quantity
-            pos.entry_price = total_cost / new_qty if new_qty > 0 else 0
-            pos.quantity = new_qty
-        else:
-            close_qty = min(abs(pos.quantity), fill.quantity)
-            pos.realized_pnl += close_qty * (pos.entry_price - fill.price)
-            pos.quantity += fill.quantity
-            if pos.quantity < 0:
-                pos.entry_price = fill.price
-
-    def _handle_sell_fill(self, pos: Position, fill: FillEvent) -> None:
-        """Handle sell fill."""
         if pos.quantity <= 0:
             total_cost = abs(pos.entry_price * pos.quantity) + fill.price * fill.quantity
             new_qty = pos.quantity - fill.quantity
@@ -319,57 +305,6 @@ class PortfolioManager:
             ...     "ETHUSDT": 3200
             ... })
         """
-        total_realized = 0.0
-        total_unrealized = 0.0
-
-        for symbol, pos in self._portfolio.positions.items():
-            pos.total_pnl = pos.realized_pnl + pos.unrealized_pnl
-            total_realized += pos.realized_pnl
-            total_unrealized += pos.unrealized_pnl
-
-        self._portfolio.total_realized_pnl = total_realized
-        self._portfolio.total_unrealized_pnl = total_unrealized
-        self._portfolio.daily_pnl = total_realized
-
-        self._portfolio.current_capital = (
-            self.initial_capital + total_realized + total_unrealized
-        )
-        self._portfolio.available_capital = (
-            self._portfolio.current_capital - 
-            sum(p.notional_value for p in self._portfolio.positions.values()) +
-            sum(abs(p.quantity * p.entry_price) for p in self._portfolio.positions.values())
-        )
-
-    def _update_drawdown(self) -> None:
-        """Update drawdown metrics."""
-        if self._portfolio.current_capital > self._portfolio.peak_capital:
-            self._portfolio.peak_capital = self._portfolio.current_capital
-
-        if self._portfolio.peak_capital > EPS:
-            self._portfolio.current_drawdown = (
-                (self._portfolio.peak_capital - self._portfolio.current_capital) /
-                self._portfolio.peak_capital
-            )
-
-        if self._portfolio.current_drawdown > self._portfolio.max_drawdown:
-            self._portfolio.max_drawdown = self._portfolio.current_drawdown
-
-    def _check_daily_reset(self) -> None:
-        """Reset daily metrics if new trading day."""
-        current_day = self._get_trading_day()
-        if current_day != self._last_day_reset:
-            self._portfolio.daily_pnl = 0.0
-            self._portfolio.daily_trades = 0
-            self._portfolio.trading_day_start = int(time.time() * 1000)
-            self._last_day_reset = current_day
-
-    def _get_trading_day(self) -> int:
-        """Get trading day timestamp (midnight)."""
-        ts = int(time.time())
-        return (ts // 86400) * 86400
-
-    def update_market_prices(self, prices: dict[str, float]) -> None:
-        """Update positions with current market prices."""
         for symbol, price in prices.items():
             if symbol in self._portfolio.positions:
                 pos = self._portfolio.positions[symbol]
@@ -465,18 +400,6 @@ class PortfolioManager:
             - daily_pnl: Today's PnL
             - positions: Number of open positions
         """
-        return {
-            "capital": self._portfolio.current_capital,
-            "available": self._portfolio.available_capital,
-            "exposure": self._portfolio.total_exposure,
-            "leverage": self._portfolio.portfolio_leverage,
-            "realized_pnl": self._portfolio.total_realized_pnl,
-            "unrealized_pnl": self._portfolio.total_unrealized_pnl,
-            "drawdown": self._portfolio.current_drawdown,
-            "max_drawdown": self._portfolio.max_drawdown,
-            "daily_pnl": self._portfolio.daily_pnl,
-            "positions": len([p for p in self._portfolio.positions.values() if not p.is_flat])
-        }
         return {
             "capital": self._portfolio.current_capital,
             "available": self._portfolio.available_capital,

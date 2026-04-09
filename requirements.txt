@@ -32,11 +32,16 @@ tqdm>=4.65.0
 psycopg2-binary>=2.9.0
 sqlalchemy>=2.0.0
 
-# vn.py (LIVE mode only - optional)
-# vnpy>=3.0.0
+# vn.py Trading Gateway (LIVE mode)
+vnpy>=3.0.0
+vnpy_binance>=1.0.0
 
 # Development & Testing
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
 pytest-cov>=4.1.0
 hypothesis>=6.82.0
+
+# Optional: For ML/Kronos integration
+torch>=2.0.0
+transformers>=4.30.0
