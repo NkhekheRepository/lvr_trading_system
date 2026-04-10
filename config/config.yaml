@@ -87,8 +87,8 @@ monitoring:
     slack_webhook: ""
     email_recipients: []
     rate_limit_per_minute: 10
-    telegram_bot_token: ""
-    telegram_chat_id: ""
+    telegram_bot_token: "8799653306:AAEe5iDM46urOR3vCAylzdT-ogqgcRAjk5Y"
+    telegram_chat_id: "7361240735"
     telegram_enabled: true
   health_check_interval: 5.0
   data_freshness_threshold_sec: 10
