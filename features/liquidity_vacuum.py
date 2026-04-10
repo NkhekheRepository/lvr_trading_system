@@ -262,6 +262,8 @@ class LiquidityVacuumDetector:
         elif direction == -1:
             return 'ask_liquidity_withdrawal'
         else:
+            if self.baseline_depth is None:
+                return 'balanced_scarcity'
             if bid_depth < self.baseline_depth * 0.5:
                 return 'bilateral_stress'
             return 'balanced_scarcity'

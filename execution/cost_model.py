@@ -43,7 +43,7 @@ class CostModel:
         notional = quantity * price
 
         spread_cost = self._calculate_spread_cost(quantity, spread)
-        slippage_cost = self._calculate_slippage(quantity, market_depth)
+        slippage_cost = self._calculate_slippage(quantity, price, market_depth)
         fee_cost = self._calculate_fee(notional, side == "buy")
         latency_cost = self._calculate_latency_cost(latency_ms, notional)
 
@@ -67,6 +67,7 @@ class CostModel:
     def _calculate_slippage(
         self,
         quantity: float,
+        price: float,
         market_depth: float
     ) -> float:
         """Slippage based on order size relative to depth."""

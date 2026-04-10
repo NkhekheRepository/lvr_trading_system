@@ -4,7 +4,7 @@ Tests for risk engine.
 
 import pytest
 
-from app.schemas import OrderRequest, OrderType, Portfolio, RiskState, Side
+from app.schemas import OrderRequest, OrderType, Portfolio, RiskState, Side, Signal
 from risk import RiskEngine, RiskLimits, PositionSizer
 
 

@@ -1,7 +1,7 @@
 system:
   name: lvr_trading_system
   version: 1.0.0
-  mode: SIM
+  mode: TESTNET
   environment: development
   log_level: INFO
   log_dir: logs
@@ -28,12 +28,18 @@ execution:
     PAPER:
       use_real_market_data: true
       slippage_multiplier: 1.0
+    TESTNET:
+      use_binance_api: true
+      slippage_multiplier: 1.0
+      testnet_url: "https://testnet.binancefuture.com"
     LIVE:
       use_vnpy: true
       slippage_multiplier: 1.5
   fees:
     maker: 0.00020
     taker: 0.00040
+  testnet_api_key: "G91ebHRA8tqXiIppBPjXhLfRgiRajbTvrWcVUo8xdGC05RiZCULSucvgMBlhtkZQ"
+  testnet_api_secret: "FwTk0ZabfsOHDWUqDnEvNTPpilTuc9P9nHMeI9T02AgERba76vV70TJa7CJElKTC"
 
 risk:
   base_risk_per_trade: 0.01
@@ -84,6 +90,24 @@ monitoring:
   health_check_interval: 5.0
   data_freshness_threshold_sec: 10
 
+autonomy:
+  enabled: true
+  mode: full_auto  # full_auto, semi_auto, manual
+  min_confidence: 0.3
+  min_edge: 0.0001
+  max_drawdown_pct: 0.15
+  max_daily_loss_pct: 0.05
+  max_leverage: 10.0
+  data_freshness_ms: 5000
+  pause_on_failure_count: 5
+
+dashboard:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8000
+  refresh_interval_ms: 1000
+  max_history: 1000
+
 state:
   checkpoint_interval_sec: 60
   event_log_enabled: true
@@ -106,3 +130,10 @@ redis:
   password: ""
   pool_size: 10
   socket_timeout: 5
+
+dashboard:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8000
+  username: "nkhekhe"
+  password: "nwa45690"

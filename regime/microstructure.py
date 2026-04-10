@@ -18,7 +18,7 @@ class MicrostructureState:
     ask_depth: float
     spread_bps: float
     ofi_slope: float
-   TradeIntensity: float
+    trade_intensity: float
     short_term_vol: float
     liquidity_regime: str
     pressure_index: float

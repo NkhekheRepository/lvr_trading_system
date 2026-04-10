@@ -102,44 +102,7 @@ class RegimeDetector:
         self._regime_history = []
 
     def check_regime(self, features: FeatureVector) -> tuple[bool, float]:
-        """
-        Check if market is in trading regime based on feature vector.
-        
-        Computes the regime statistic T = |returns| / volatility and compares
-        against the configured threshold to determine if trading should be
-        allowed in the current market conditions.
-        
-        Args:
-            features: FeatureVector containing returns and volatility metrics.
-                Required fields: returns, volatility, timestamp, symbol.
-        
-        Returns:
-            Tuple of (in_trading_regime, regime_T) where:
-            - in_trading_regime: True if trading is allowed, False if blocked
-            - regime_T: The computed regime statistic value
-        
-        Algorithm:
-            1. Handle edge case: if volatility <= EPS, return (True, 0.0)
-            2. Compute T = abs(returns) / volatility
-            3. Determine regime: T <= threshold means in regime
-            4. Update rolling history (max 1000 entries, pruned to 500)
-            5. Log warning if regime blocked
-        
-        Example:
-            >>> features = FeatureVector(
-            ...     symbol="BTCUSDT",
-            ...     timestamp=1700000000000,
-            ...     returns=0.0025,
-            ...     volatility=0.0015
-            ... )
-            >>> in_regime, T = detector.check_regime(features)
-            >>> print(f"T={T:.2f}, trading_allowed={in_regime}")
-            T=1.67, trading_allowed=True
-        """
-        if features.volatility <= EPS:
-            return True, 0.0
-
-        T = abs(features.returns) / features.volatility
+        T = abs(features.returns) / (features.volatility + EPS)
 
         in_regime = T <= self.threshold
 

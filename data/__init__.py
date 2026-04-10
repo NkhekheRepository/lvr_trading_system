@@ -2,7 +2,7 @@
 from data.loader import DataLoader, OrderBookLoader
 from data.replay_engine import ReplayEngine, SyncReplayEngine
 from data.sample_data import SampleDataGenerator, generate_test_dataset
-from data.websocket import MultiExchangeWebSocket, ExchangeConfig
+from data.websocket import MultiExchangeWebSocket, ExchangeConfig, Exchange
 from data.consensus import DataConsensus, ConsensusResult, DataValidator
 from data.quality import DataQualityMonitor, QualityMetrics
 
@@ -10,7 +10,7 @@ __all__ = [
     "DataLoader", "OrderBookLoader",
     "ReplayEngine", "SyncReplayEngine",
     "SampleDataGenerator", "generate_test_dataset",
-    "MultiExchangeWebSocket", "ExchangeConfig",
+    "MultiExchangeWebSocket", "ExchangeConfig", "Exchange",
     "DataConsensus", "ConsensusResult", "DataValidator",
     "DataQualityMonitor", "QualityMetrics",
 ]

@@ -16,7 +16,6 @@ Exports:
 from core.event import (
     Event,
     EventType,
-    EventChannel,
     EventPriority,
     create_market_tick_event,
     create_order_event,

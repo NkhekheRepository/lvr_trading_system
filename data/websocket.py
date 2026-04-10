@@ -36,6 +36,7 @@ class ExchangeConfig:
     timeout: float = 10.0
     max_reconnect_attempts: int = 5
     heartbeat_interval: float = 30.0
+    is_futures: bool = False
 
 
 @dataclass
@@ -127,13 +128,14 @@ class MultiExchangeWebSocket:
         self.states[config.exchange] = WebSocketState()
         
     async def connect(self, exchange: Exchange, symbols: list[str]) -> bool:
-        """
-        Connect to exchange WebSocket and subscribe to symbols.
+        """Connect to exchange WebSocket and subscribe to symbols."""
         
-        Returns True if connection successful.
-        """
         if exchange not in self.exchanges:
-            logger.error(f"Exchange {exchange} not configured")
+            return False
+            
+        config = self.exchanges[exchange]
+        
+        if not config.enabled:
             return False
             
         config = self.exchanges[exchange]
@@ -203,8 +205,11 @@ class MultiExchangeWebSocket:
         config = self.exchanges[exchange]
         
         if exchange == Exchange.BINANCE:
-            symbols_param = '/'.join([s.lower().replace('/', '') for s in symbols])
-            return f"wss://stream.binance.com:9443/stream?streams={'/'.join([f'{s.lower()}@ticker/{s.lower()}@depth/{s.lower()}@trade' for s in symbols])}"
+            if config.is_futures:
+                streams = [f"{s.lower()}@ticker" for s in symbols]
+            else:
+                streams = [f"{s.lower()}@ticker" for s in symbols]
+            return f"{config.ws_url}/stream?streams={'/'.join(streams)}"
             
         elif exchange == Exchange.BINANCE_US:
             symbols_param = '/'.join([s.lower().replace('/', '') for s in symbols])
@@ -275,6 +280,10 @@ class MultiExchangeWebSocket:
         """Process a single message item."""
         event_type = data.get('e', '')
         
+        if 'data' in data:
+            data = data['data']
+            event_type = data.get('e', '')
+        
         if event_type == '24hrTicker' or data.get('s'):
             ticker = self._parse_ticker(exchange, data)
             if ticker and self.on_ticker:
@@ -293,16 +302,22 @@ class MultiExchangeWebSocket:
     def _parse_ticker(self, exchange: Exchange, data: dict) -> Optional[TickerData]:
         """Parse ticker data from message."""
         try:
+            symbol = data.get('s', '')
+            last_price = data.get('c', 0) or data.get('last', 0) or data.get('L', 0)
+            bid_price = data.get('b', 0)
+            ask_price = data.get('a', 0)
+            volume = data.get('v', 0) or data.get('q', 0)
+            
             return TickerData(
-                symbol=data.get('s', ''),
+                symbol=symbol,
                 exchange=exchange,
-                bid=float(data.get('b', data.get('bid', 0))),
-                ask=float(data.get('a', data.get('ask', 0))),
-                last=float(data.get('c', data.get('last', 0))),
-                volume_24h=float(data.get('v', data.get('volume', 0))),
+                bid=float(bid_price) if bid_price else 0.0,
+                ask=float(ask_price) if ask_price else 0.0,
+                last=float(last_price) if last_price else 0.0,
+                volume_24h=float(volume) if volume else 0.0,
                 timestamp=datetime.fromtimestamp(
                     int(data.get('E', data.get('ts', 0))) / 1000
-                ),
+                ) if data.get('E') or data.get('ts') else datetime.now(),
             )
         except (ValueError, TypeError) as e:
             logger.warning(f"Failed to parse ticker: {e}")

@@ -62,6 +62,7 @@ class TimeInForce(str, Enum):
 class ExecutionMode(str, Enum):
     SIM = "SIM"
     PAPER = "PAPER"
+    TESTNET = "TESTNET"
     LIVE = "LIVE"
 
 

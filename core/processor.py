@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, TypeVar, Generic
 
-from core.event import Event, EventType, EventChannel
+from core.event import Event, EventType
+from core.bus import EventChannel
 from core.bus import EventBus
 
 logger = logging.getLogger(__name__)

@@ -45,6 +45,7 @@ Example:
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -521,7 +522,7 @@ class DriftDetector:
         """Check if drift was recently detected."""
         return self._drift_detected
     
-    def update(self, value: float) -> DriftInfo:
+    def update(self, value: float) -> 'DriftInfo':
         """
         Update drift detector with new observation.
         
