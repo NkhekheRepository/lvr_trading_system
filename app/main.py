@@ -181,8 +181,14 @@ class TradingSystem:
 
         self.metrics = MetricsCollector()
 
+        alert_config = self.config.get("monitoring", {}).get("alerts", {})
         self.alert_manager = AlertManager(
-            rate_limit_per_minute=self.config.get("monitoring", {}).get("alerts", {}).get("rate_limit_per_minute", 10)
+            rate_limit_per_minute=alert_config.get("rate_limit_per_minute", 10),
+            slack_webhook=alert_config.get("slack_webhook"),
+            email_recipients=alert_config.get("email_recipients", []),
+            telegram_bot_token=alert_config.get("telegram_bot_token"),
+            telegram_chat_id=alert_config.get("telegram_chat_id"),
+            telegram_enabled=alert_config.get("telegram_enabled", True),
         )
 
         self.protection = ProtectionSystem(alert_manager=self.alert_manager)
@@ -267,6 +273,11 @@ class TradingSystem:
         """Start the trading system."""
         logger.info("Starting trading system", mode=self.mode.value)
 
+        await self.alert_manager.send_system_status(
+            status="STARTING",
+            mode=self.mode.value,
+        )
+
         await self.executor.connect()
         await self.state_store.connect()
 
@@ -276,6 +287,11 @@ class TradingSystem:
 
         self._running = True
 
+        await self.alert_manager.send_system_status(
+            status="RUNNING",
+            mode=self.mode.value,
+        )
+
         if self.mode == ExecutionMode.SIM:
             await self._run_backtest()
         else:
@@ -284,6 +300,12 @@ class TradingSystem:
     async def stop(self) -> None:
         """Stop the trading system."""
         logger.info("Stopping trading system")
+
+        await self.alert_manager.send_system_status(
+            status="STOPPING",
+            mode=self.mode.value,
+        )
+
         self._running = False
 
         await self.state_store.checkpoint(force=True)
@@ -326,11 +348,20 @@ class TradingSystem:
         while self._running:
             try:
                 metrics = self.metrics.collect()
+                drawdown = self.portfolio.portfolio.current_drawdown
+                daily_pnl_pct = self.portfolio.portfolio.daily_pnl / self.portfolio.initial_capital
+
                 self.protection.evaluate(
-                    metrics,
-                    self.portfolio.portfolio.current_drawdown,
-                    self.portfolio.portfolio.daily_pnl / self.portfolio.initial_capital
+                    metrics, drawdown, daily_pnl_pct
                 )
+
+                max_dd = self.config.get("risk", {}).get("limits", {}).get("max_drawdown_pct", 0.10)
+                if drawdown > max_dd * 0.5:
+                    await self.alert_manager.send_drawdown_alert(
+                        drawdown_pct=drawdown,
+                        max_drawdown_pct=max_dd,
+                        daily_pnl=self.portfolio.portfolio.daily_pnl,
+                    )
 
                 await asyncio.sleep(1)
 
@@ -448,7 +479,7 @@ class TradingSystem:
     async def _execute_order(self, signal, tick, qty) -> None:
         """Execute order directly."""
         from app.schemas import OrderRequest, OrderType, TimeInForce
-        
+
         order = OrderRequest(
             trace_id=signal.trace_id,
             symbol=signal.symbol,
@@ -458,14 +489,50 @@ class TradingSystem:
             price=tick.price,
             time_in_force=TimeInForce.GTC
         )
-        
+
         print(f">> ORDER: {order.symbol} {order.side} {order.quantity} @ {order.price}", flush=True)
+
+        await self.alert_manager.send_signal_alert(
+            symbol=signal.symbol,
+            direction=signal.direction.value,
+            strength=signal.strength,
+            confidence=signal.confidence,
+            edge=signal.expected_edge,
+        )
+
         result = await self.executor.submit_order(order)
-        
+
         print(f">> RESULT: success={result.success}", flush=True)
-        
+
         if result.success:
             for fill in result.fill_events:
                 print(f">> FILLED: price={fill.price} qty={fill.quantity}", flush=True)
                 pos = self.portfolio.portfolio.get_position(order.symbol)
                 print(f">> POSITION: {pos.quantity}", flush=True)
+
+                await self.alert_manager.send_trade_alert(
+                    symbol=order.symbol,
+                    side=order.side.value,
+                    quantity=fill.quantity,
+                    price=order.price or tick.price,
+                    order_id=order.order_id,
+                    fill_price=fill.price,
+                    fee=fill.fee,
+                    slippage=fill.slippage,
+                )
+
+                if abs(pos.quantity) > 0:
+                    await self.alert_manager.send_position_alert(
+                        symbol=order.symbol,
+                        quantity=pos.quantity,
+                        entry_price=pos.entry_price,
+                        unrealized_pnl=pos.unrealized_pnl,
+                    )
+        else:
+            reason = result.reject_event.reason if result.reject_event else "unknown"
+            error_code = result.reject_event.error_code if result.reject_event else ""
+            await self.alert_manager.send_rejection_alert(
+                symbol=order.symbol,
+                reason=reason,
+                error_code=error_code,
+            )
