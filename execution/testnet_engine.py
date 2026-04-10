@@ -213,18 +213,21 @@ class TestnetExecutionEngine(ExecutionEngine):
         import hashlib
         import urllib.parse
         
+        quantity = self._round_quantity(order.symbol, order.quantity)
+        price = self._round_price(order.symbol, order.price) if order.price else None
+        
         timestamp = int(time.time() * 1000)
         
         params = {
             "symbol": order.symbol,
             "side": order.side.value.upper(),
             "type": order.order_type.value.upper() if order.order_type.value != "post_only" else "LIMIT",
-            "quantity": order.quantity,
+            "quantity": quantity,
             "timestamp": timestamp,
         }
         
-        if order.order_type.value == "limit" and order.price:
-            params["price"] = order.price
+        if order.order_type.value == "limit" and price:
+            params["price"] = price
             params["timeInForce"] = order.time_in_force.value.upper()
         
         if order.reduce_only:
@@ -428,6 +431,26 @@ class TestnetExecutionEngine(ExecutionEngine):
             status=OrderStatus.REJECTED,
             reject_event=reject
         )
+
+    SYMBOL_PRECISION = {
+        "BTCUSDT": {"quantity": 3, "price": 1},
+        "ETHUSDT": {"quantity": 2, "price": 2},
+        "BNBUSDT": {"quantity": 1, "price": 2},
+        "SOLUSDT": {"quantity": 0, "price": 2},
+        "XRPUSDT": {"quantity": 1, "price": 4},
+        "DOGEUSDT": {"quantity": 0, "price": 5},
+        "ADAUSDT": {"quantity": 0, "price": 5},
+    }
+
+    DEFAULT_PRECISION = {"quantity": 3, "price": 2}
+
+    def _round_quantity(self, symbol: str, quantity: float) -> float:
+        precision = self.SYMBOL_PRECISION.get(symbol, self.DEFAULT_PRECISION)
+        return round(quantity, precision["quantity"])
+
+    def _round_price(self, symbol: str, price: float) -> float:
+        precision = self.SYMBOL_PRECISION.get(symbol, self.DEFAULT_PRECISION)
+        return round(price, precision["price"])
 
     def update_order_book(self, book: OrderBookSnapshot) -> None:
         """Update order book for simulation fallback."""

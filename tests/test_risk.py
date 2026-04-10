@@ -4,7 +4,7 @@ Tests for risk engine.
 
 import pytest
 
-from app.schemas import OrderRequest, OrderType, Portfolio, RiskState, Side, Signal
+from app.schemas import OrderRequest, OrderType, Portfolio, Position, RiskState, Side, Signal
 from risk import RiskEngine, RiskLimits, PositionSizer
 
 
@@ -46,6 +46,7 @@ class TestRiskEngine:
     def test_high_leverage_rejected(self, engine, portfolio):
         """High leverage should be rejected."""
         portfolio.current_capital = 10000
+        portfolio.positions["BTCUSDT"] = Position(symbol="BTCUSDT", quantity=3.0, entry_price=50000, current_price=50000)
 
         order = OrderRequest(
             trace_id="test",
@@ -56,7 +57,7 @@ class TestRiskEngine:
             price=50000
         )
 
-        risk_state = RiskState(current_leverage=15)
+        risk_state = RiskState()
         result = engine.check_order(order, None, portfolio, risk_state)
 
         assert result.approved is False

@@ -13,19 +13,19 @@ class TestSimulatedExecution:
     """Test simulated execution."""
 
     @pytest.fixture
-    async def engine(self):
+    def engine(self):
         engine = SimulatedExecutionEngine(
             slippage_alpha=0.5,
             latency_ms=50,
             zero_slippage=False
         )
-        await engine.connect()
-        yield engine
-        await engine.disconnect()
+        return engine
 
     @pytest.mark.asyncio
     async def test_basic_order(self, engine):
         """Should execute basic order."""
+        await engine.connect()
+
         order = OrderRequest(
             trace_id="test-123",
             symbol="BTCUSDT",
@@ -43,9 +43,13 @@ class TestSimulatedExecution:
         assert result.slippage >= 0
         assert result.fee >= 0
 
+        await engine.disconnect()
+
     @pytest.mark.asyncio
     async def test_slippage_bounds(self, engine):
         """Slippage should be within expected bounds."""
+        await engine.connect()
+
         slippage_total = 0
         n_orders = 10
 
@@ -64,6 +68,8 @@ class TestSimulatedExecution:
         avg_slippage = slippage_total / n_orders
         assert avg_slippage >= 0
         assert avg_slippage < 100
+
+        await engine.disconnect()
 
 
 class TestFillModel:

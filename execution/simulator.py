@@ -492,37 +492,6 @@ class SimulatedExecutionEngine(ExecutionEngine):
             status=OrderStatus.REJECTED,
             reject_event=reject
         )
-        if order.symbol not in self._positions:
-            self._positions[order.symbol] = Position(symbol=order.symbol)
-
-        pos = self._positions[order.symbol]
-        qty = fill_result["filled_qty"]
-        price = fill_result["avg_price"]
-
-        if order.side == Side.BUY:
-            if pos.quantity >= 0:
-                new_qty = pos.quantity + qty
-                pos.entry_price = (pos.entry_price * pos.quantity + price * qty) / new_qty if new_qty > 0 else 0
-                pos.quantity = new_qty
-            else:
-                if qty <= abs(pos.quantity):
-                    pos.quantity += qty
-                else:
-                    pos.quantity += qty
-                    pos.entry_price = price
-        else:
-            if pos.quantity <= 0:
-                new_qty = pos.quantity - qty
-                pos.entry_price = (pos.entry_price * abs(pos.quantity) + price * qty) / abs(new_qty) if new_qty != 0 else 0
-                pos.quantity = new_qty
-            else:
-                if qty <= pos.quantity:
-                    pos.quantity -= qty
-                else:
-                    pos.quantity -= qty
-                    pos.entry_price = price
-
-        pos.last_update = int(time.time() * 1000)
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel order (simulated)."""

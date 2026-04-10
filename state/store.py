@@ -21,6 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, Any, List, AsyncIterator
 from collections import deque
+from uuid import uuid4
 
 import redis.asyncio as redis
 
@@ -657,6 +658,3 @@ class StateStore:
                         yield StoredEvent.from_dict(data)
                 except json.JSONDecodeError:
                     continue
-
-
-from uuid import uuid4

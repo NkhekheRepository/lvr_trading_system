@@ -80,6 +80,7 @@ learning:
   max_change_per_update: 0.05
   cooldown_ticks: 10
   edge_threshold: 0.001
+  warmup_enabled: true
 
 monitoring:
   collection_interval: 1.0
